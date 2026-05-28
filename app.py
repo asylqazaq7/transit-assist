@@ -366,7 +366,7 @@ SYSTEM_PROMPT = """Ты — эксперт по таможенному декл�
     "total_value": 0, "currency": ""
   },
   "grouped_items": [{
-    "num": 1, "hs6": "", "hs10_codes": "", "name_ru": "", "name_en": "",
+    "num": 1, "hs6": "", "hs10_codes": "", "name_ru": "",
     "qty": 0, "pkgs": 0, "net_weight": 0, "gross_weight": 0, "value": 0,
     "source_rows": 0, "note": ""
   }],
@@ -401,62 +401,132 @@ def extract_text_from_pdf(file_bytes):
 
 def extract_text_from_excel(file_bytes):
     """
-    Умное извлечение данных из Excel согласно промпту:
-    - Объединённые ячейки: РАЗЪЕДИНЯЕТ и копирует значение во все составляющие строки
-      (важно для PKGS — когда одному номеру упаковки соответствует несколько товаров)
-    - Убирает: форматирование, картинки, скрытые листы, пустые строки
-    - Сохраняет все данные: ТН ВЭД, наименования, количество, веса, стоимость
+    Извлечение данных из Excel с правильной логикой PKGS согласно промпту:
+    1. До разъединения сохраняем группы строк объединённых ячеек столбца PKGS
+    2. Разъединяем все объединённые ячейки, копируя значения
+    3. Применяем логику PKGS:
+       - Внутри каждой объединённой упаковки: PKGS=1 → товару с max брутто,
+         остальным PKGS=0
+       - Если несколько товаров с одинаковым max брутто → первому из них
+       - Одиночные строки (не объединённые) → оставляем как есть
     """
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     parts = []
-
     SKIP_KEYWORDS = ['инструк', 'справ', 'шаблон', 'template', 'help', 'readme']
 
     for sn in wb.sheetnames:
         ws = wb[sn]
-
-        # Пропускаем явно служебные листы
         if any(kw in sn.lower() for kw in SKIP_KEYWORDS):
             continue
 
-        # ── РАЗЪЕДИНЯЕМ ОБЪЕДИНЁННЫЕ ЯЧЕЙКИ ──────────────────────────────────
-        # Согласно промпту: копируем значение объединённой ячейки во все составляющие
-        # Это критично для PKGS и наименований упаковок
+        max_row = ws.max_row or 0
+        max_col = ws.max_column or 0
+
+        # ── ШАГ 1: Находим заголовки ─────────────────────────────────────────────
+        header_row = None
+        pkgs_col = None
+        gross_col = None
+
+        for r in range(1, min(30, max_row + 1)):
+            row_str = " ".join(
+                str(ws.cell(r, c).value).lower()
+                for c in range(1, max_col + 1)
+                if ws.cell(r, c).value
+            )
+            if any(kw in row_str for kw in ['pkgs', 'кол-во мест', 'мест', 'package']):
+                header_row = r
+                for c in range(1, max_col + 1):
+                    v = ws.cell(r, c).value
+                    if v is None:
+                        continue
+                    v_low = str(v).lower()
+                    if any(kw in v_low for kw in ['pkgs', 'кол-во мест', 'мест', 'package']):
+                        pkgs_col = c
+                    if any(kw in v_low for kw in ['брутто', 'gross weight', 'gross']):
+                        gross_col = c
+                break
+
+        # ── ШАГ 2: Сохраняем группы объединённых ячеек столбца PKGS ─────────────
+        # Делаем ЭТО ДО разъединения — пока ещё знаем какие строки объединены
         merged_ranges = list(ws.merged_cells.ranges)
-        for merged_range in merged_ranges:
-            # Получаем значение из верхней левой ячейки объединения
-            top_left = ws.cell(merged_range.min_row, merged_range.min_col)
-            merge_value = top_left.value
+        pkgs_merged_groups = {}  # {min_row: [список строк диапазона]}
+        pkgs_merged_rows = set()
 
-            # Разъединяем
-            ws.unmerge_cells(str(merged_range))
+        if pkgs_col:
+            for mr in merged_ranges:
+                if mr.min_col == pkgs_col and mr.max_col == pkgs_col:
+                    rows = list(range(mr.min_row, mr.max_row + 1))
+                    pkgs_merged_groups[mr.min_row] = rows
+                    for r in rows:
+                        pkgs_merged_rows.add(r)
 
-            # Копируем значение во все ячейки которые были объединены
-            for row_idx in range(merged_range.min_row, merged_range.max_row + 1):
-                for col_idx in range(merged_range.min_col, merged_range.max_col + 1):
-                    ws.cell(row_idx, col_idx).value = merge_value
+        # ── ШАГ 3: Сохраняем все значения объединённых ячеек ─────────────────────
+        merge_fill = {}
+        for mr in merged_ranges:
+            mv = ws.cell(mr.min_row, mr.min_col).value
+            for ri in range(mr.min_row, mr.max_row + 1):
+                for ci in range(mr.min_col, mr.max_col + 1):
+                    merge_fill[(ri, ci)] = mv
 
-        # ── ЧИТАЕМ ДАННЫЕ ─────────────────────────────────────────────────────
-        sheet_rows = []
-        for row in ws.iter_rows(values_only=True):
-            cleaned = []
-            for c in row:
-                if c is None:
-                    cleaned.append("")
-                elif isinstance(c, float):
-                    # Убираем лишние .0 у целых чисел
-                    cleaned.append(str(int(c)) if c == int(c) else str(round(c, 4)))
+        # ── ШАГ 4: Разъединяем и проставляем значения ────────────────────────────
+        for mr in merged_ranges:
+            ws.unmerge_cells(str(mr))
+        for (ri, ci), v in merge_fill.items():
+            ws.cell(ri, ci).value = v
+
+        # ── ШАГ 5: Применяем логику PKGS для объединённых групп ──────────────────
+        if pkgs_col and gross_col and pkgs_merged_groups:
+            for start_row, row_indices in pkgs_merged_groups.items():
+                # Пропускаем строки заголовка и шапки
+                data_rows = [ri for ri in row_indices if ri > (header_row or 0)]
+                if not data_rows:
+                    continue
+
+                if len(data_rows) == 1:
+                    # Один товар — PKGS=1
+                    ws.cell(data_rows[0], pkgs_col).value = 1
                 else:
-                    val = str(c).strip()
-                    if len(val) > 500:
-                        val = val[:500]
-                    cleaned.append(val)
+                    # Несколько товаров — max брутто получает PKGS=1, остальные 0
+                    gross_values = []
+                    for ri in data_rows:
+                        gv = ws.cell(ri, gross_col).value
+                        try:
+                            gross_values.append(float(gv) if gv is not None else 0.0)
+                        except (ValueError, TypeError):
+                            gross_values.append(0.0)
 
-            # Пропускаем полностью пустые строки
-            if not any(c for c in cleaned):
+                    max_gross = max(gross_values) if gross_values else 0.0
+                    assigned = False
+                    for ri, gv in zip(data_rows, gross_values):
+                        if not assigned and gv == max_gross:
+                            ws.cell(ri, pkgs_col).value = 1
+                            assigned = True
+                        else:
+                            # Именно 0, не пустое
+                            ws.cell(ri, pkgs_col).value = 0
+
+        # ── ШАГ 6: Формируем текстовый вывод ─────────────────────────────────────
+        sheet_rows = []
+        for r in range(1, max_row + 1):
+            row_vals = []
+            for c in range(1, max_col + 1):
+                val = ws.cell(r, c).value
+                if val is None:
+                    row_vals.append("")
+                elif isinstance(val, float):
+                    row_vals.append(
+                        str(int(val)) if val == int(val) else str(round(val, 4))
+                    )
+                else:
+                    s = str(val).strip()
+                    if len(s) > 500:
+                        s = s[:500]
+                    row_vals.append(s)
+
+            if not any(v for v in row_vals):
                 continue
 
-            sheet_rows.append(" | ".join(cleaned).rstrip(" |"))
+            sheet_rows.append(" | ".join(row_vals).rstrip(" |"))
 
         if sheet_rows:
             parts.append(f"=== Лист: {sn} ===")
@@ -468,7 +538,164 @@ def extract_text_from_excel(file_bytes):
 
     result = "\n".join(parts)
 
-    # Если текст всё ещё слишком большой — берём первые 120000 символов
+    MAX_CHARS = 120000
+    if len(result) > MAX_CHARS:
+        result = result[:MAX_CHARS]
+        result += "\n\n[ПРИМЕЧАНИЕ: Данные обрезаны из-за размера файла. Обработаны первые строки.]"
+
+    return result
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    parts = []
+
+    SKIP_KEYWORDS = ['инструк', 'справ', 'шаблон', 'template', 'help', 'readme']
+
+    for sn in wb.sheetnames:
+        ws = wb[sn]
+
+        if any(kw in sn.lower() for kw in SKIP_KEYWORDS):
+            continue
+
+        # ── ШАГ 1: Сохраняем значения объединённых ячеек ────────────────────────
+        merge_fill = {}
+        merged_ranges = list(ws.merged_cells.ranges)
+        for merged_range in merged_ranges:
+            merge_value = ws.cell(merged_range.min_row, merged_range.min_col).value
+            for row_idx in range(merged_range.min_row, merged_range.max_row + 1):
+                for col_idx in range(merged_range.min_col, merged_range.max_col + 1):
+                    merge_fill[(row_idx, col_idx)] = merge_value
+
+        # ── ШАГ 2: Разъединяем и проставляем значения ───────────────────────────
+        for merged_range in merged_ranges:
+            ws.unmerge_cells(str(merged_range))
+        for (row_idx, col_idx), value in merge_fill.items():
+            ws.cell(row_idx, col_idx).value = value
+
+        # ── ШАГ 3: Читаем все данные в массив ───────────────────────────────────
+        max_row = ws.max_row or 0
+        max_col = ws.max_column or 0
+
+        # Читаем данные в список словарей {col_idx: value}
+        all_rows = []
+        header_row = None
+        pkgs_col = None
+        gross_col = None
+
+        for r in range(1, max_row + 1):
+            row_data = {}
+            for c in range(1, max_col + 1):
+                row_data[c] = ws.cell(r, c).value
+
+            # Ищем строку заголовков по ключевым словам
+            if header_row is None:
+                row_str = " ".join(str(v).lower() for v in row_data.values() if v)
+                if any(kw in row_str for kw in ['pkgs', 'кол-во мест', 'мест', 'package']):
+                    header_row = r
+                    # Определяем номера столбцов PKGS и брутто
+                    for c, v in row_data.items():
+                        if v is None:
+                            continue
+                        v_low = str(v).lower()
+                        if any(kw in v_low for kw in ['pkgs', 'кол-во мест', 'мест', 'package']):
+                            pkgs_col = c
+                        if any(kw in v_low for kw in ['брутто', 'gross', 'gross weight']):
+                            gross_col = c
+
+            all_rows.append((r, row_data))
+
+        # ── ШАГ 4: Применяем логику PKGS ─────────────────────────────────────────
+        # Только если нашли столбцы PKGS и брутто
+        if pkgs_col and gross_col and header_row:
+            # Группируем строки по значению PKGS (номеру упаковки)
+            # Строки где PKGS не None и > 0 — начало упаковки
+            # Строки где PKGS = None — продолжение той же упаковки
+
+            current_pkg_rows = []   # строки текущей упаковки
+            current_pkg_val = None  # значение PKGS текущей упаковки
+            pkgs_groups = []        # список групп [(pkg_value, [row_indices])]
+
+            for r, row_data in all_rows:
+                if r <= header_row:
+                    continue
+                # Проверяем есть ли данные в строке
+                if not any(v for v in row_data.values() if v is not None):
+                    continue
+
+                pkgs_val = row_data.get(pkgs_col)
+
+                if pkgs_val is not None and pkgs_val != 0 and pkgs_val != "":
+                    # Новая упаковка начинается
+                    if current_pkg_rows:
+                        pkgs_groups.append((current_pkg_val, current_pkg_rows))
+                    current_pkg_val = pkgs_val
+                    current_pkg_rows = [r]
+                elif current_pkg_rows:
+                    # Продолжение текущей упаковки
+                    current_pkg_rows.append(r)
+                else:
+                    # Строка до первой упаковки — пропускаем
+                    pass
+
+            # Добавляем последнюю группу
+            if current_pkg_rows:
+                pkgs_groups.append((current_pkg_val, current_pkg_rows))
+
+            # Для каждой группы применяем логику: max брутто → PKGS=1, остальные → PKGS=0
+            for pkg_val, row_indices in pkgs_groups:
+                if len(row_indices) == 1:
+                    # Один товар в упаковке — просто PKGS=1
+                    ws.cell(row_indices[0], pkgs_col).value = 1
+                else:
+                    # Несколько товаров — ищем max брутто
+                    gross_values = []
+                    for ri in row_indices:
+                        gv = ws.cell(ri, gross_col).value
+                        try:
+                            gross_values.append(float(gv) if gv is not None else 0.0)
+                        except (ValueError, TypeError):
+                            gross_values.append(0.0)
+
+                    max_gross = max(gross_values)
+                    assigned = False
+                    for ri, gv in zip(row_indices, gross_values):
+                        if not assigned and gv == max_gross:
+                            # Первый с максимальным весом → PKGS=1
+                            ws.cell(ri, pkgs_col).value = 1
+                            assigned = True
+                        else:
+                            # Остальные → PKGS=0 (именно ноль, не пустое)
+                            ws.cell(ri, pkgs_col).value = 0
+
+        # ── ШАГ 5: Формируем текстовый вывод ────────────────────────────────────
+        sheet_rows = []
+        for r in range(1, max_row + 1):
+            row_vals = []
+            for c in range(1, max_col + 1):
+                val = ws.cell(r, c).value
+                if val is None:
+                    row_vals.append("")
+                elif isinstance(val, float):
+                    row_vals.append(str(int(val)) if val == int(val) else str(round(val, 4)))
+                else:
+                    s = str(val).strip()
+                    if len(s) > 500:
+                        s = s[:500]
+                    row_vals.append(s)
+
+            if not any(v for v in row_vals):
+                continue
+
+            sheet_rows.append(" | ".join(row_vals).rstrip(" |"))
+
+        if sheet_rows:
+            parts.append(f"=== Лист: {sn} ===")
+            prev = None
+            for row_str in sheet_rows:
+                if row_str != prev:
+                    parts.append(row_str)
+                    prev = row_str
+
+    result = "\n".join(parts)
+
     MAX_CHARS = 120000
     if len(result) > MAX_CHARS:
         result = result[:MAX_CHARS]
@@ -544,8 +771,8 @@ def create_excel_report(data, mode="full"):
     else:
         ws2=wb.active; ws2.title="Сводная HS6 (KEDEN)"
 
-    h2=["№","Код ТН ВЭД\n(6 зн.)","Полные коды HS10","Наименование (RU)","Наименование (EN)","Кол-во\n(шт)","Мест\n(PKGS)","Вес нетто\n(кг)","Вес брутто\n(кг)","Стоимость","Строк","Примечание"]
-    cw=[5,12,22,35,35,10,8,12,12,14,7,28]
+    h2=["№","Код ТН ВЭД\n(6 зн.)","Полные коды HS10","Наименование (RU)","Кол-во\n(шт)","Мест\n(PKGS)","Вес нетто\n(кг)","Вес брутто\n(кг)","Стоимость","Строк","Примечание"]
+    cw=[5,12,22,40,10,8,12,12,14,7,28]
     for i,(h,w) in enumerate(zip(h2,cw),1): ws2.column_dimensions[get_column_letter(i)].width=w
     if mode=="quick":
         info=f"Инвойс: {stats.get('invoice_number','—')}  |  {stats.get('sender','—')} → {stats.get('receiver','—')}  |  Сценарий: {stats.get('transit_scenario','—')}"
@@ -563,7 +790,7 @@ def create_excel_report(data, mode="full"):
     for idx,item in enumerate(items,ds):
         has_m=item.get("hs10_codes","") and "," in str(item.get("hs10_codes",""))
         fl=YEL if has_m else None
-        for col,val in enumerate([item.get("num",idx-ds+1),item.get("hs6",""),item.get("hs10_codes",""),item.get("name_ru",""),item.get("name_en",""),item.get("qty",0),item.get("pkgs",0),item.get("net_weight",0),item.get("gross_weight",0),item.get("value",0),item.get("source_rows",1),item.get("note","")],1):
+        for col,val in enumerate([item.get("num",idx-ds+1),item.get("hs6",""),item.get("hs10_codes",""),item.get("name_ru",""),item.get("qty",0),item.get("pkgs",0),item.get("net_weight",0),item.get("gross_weight",0),item.get("value",0),item.get("source_rows",1),item.get("note","")],1):
             cell=ws2.cell(row=idx,column=col,value=val); cell.font=NRM; cell.border=BRD; cell.alignment=LFT
             if fl: cell.fill=fl
     tr=ds+len(items); ws2.cell(row=tr,column=1,value="ИТОГО").font=KB
